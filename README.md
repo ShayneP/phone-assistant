@@ -2,7 +2,7 @@
 
 ## Overview
 
-This repository contains an example implementation of a voice-enabled phone assistant using LiveKit and OpenAI. The `agent.py` module demonstrates how to handle voice interactions, DTMF signals, and SIP REFER transfers to different departments based on user input.
+This repository contains an example implementation of a voice-enabled phone assistant using [LiveKit](https://docs.livekit.io/agents/overview/) and [OpenAI](https://platform.openai.com/docs/concepts). The `agent.py` module demonstrates how to handle voice interactions, DTMF signals, and SIP REFER transfers to different departments based on user input.
 
 The assistant provides options for callers to be transferred to Billing, Technical Support, or Customer Service departments by pressing corresponding digits.
 
