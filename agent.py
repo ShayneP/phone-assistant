@@ -7,19 +7,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Annotated, Optional
+
 from dotenv import load_dotenv
 from livekit import rtc, api
-from livekit.agents import (
-    AutoSubscribe,
-    JobContext,
-    WorkerOptions,
-    cli,
-    llm,
-)
+from livekit import agents
+from livekit.agents import JobContext, WorkerOptions, llm
+from livekit.agents.llm import function_tool
+from livekit.agents.voice import Agent, AgentSession, RunContext
 from livekit.protocol import sip as proto_sip
-from livekit.agents.multimodal import MultimodalAgent
-from livekit.plugins import openai
-
+from livekit.plugins import openai, silero
+from pydantic import Field
 
 # Initialize environment variables
 # The .env.local file should look like:
@@ -37,95 +37,79 @@ logger = logging.getLogger("phone-assistant")
 logger.setLevel(logging.INFO)
 
 
-class PhoneAssistant:
+@dataclass
+class UserData:
+    """Store user data and state for the phone assistant."""
+    selected_department: Optional[str] = None
+    livekit_api: Optional[api.LiveKitAPI] = None
+    ctx: Optional[JobContext] = None
+
+
+RunContext_T = RunContext[UserData]
+
+
+class PhoneAssistant(Agent):
     """
-    A simple multimodal phone assistant that handles voice interactions. You can transfer the call to a department
-    based on the DTMF digit pressed by the user.
+    A voice-enabled phone assistant that handles voice interactions.
+    You can transfer the call to a department based on the DTMF digit pressed by the user.
     """
 
-    def __init__(self, context: JobContext):
+    def __init__(self) -> None:
         """
-        Initialize the PhoneAssistant with the context about the room, participant, etc.
-
-        Args:
-            context (JobContext): The context for the job.
+        Initialize the PhoneAssistant with customized instructions.
         """
-        self.context = context
-        self.assistant = None
-        self.model = None
-        self.livekit_api = None
+        instructions = (
+            "You are a friendly assistant providing support. "
+            "Please inform users they can:\n"
+            "- Press 1 for Billing\n"
+            "- Press 2 for Technical Support\n"
+            "- Press 3 for Customer Service"
+        )
+        super().__init__(instructions=instructions)
 
-    async def say(self, message: str) -> None:
-        """
-        Ask the assistant to speak a message to the user. The assistant needs to be told to use its
-        voice to respond. If you don't do this, the assistant may respond with text instead of voice,
-        which doesn't make much sense on a phone call.
+    async def on_enter(self) -> None:
+        """Called when the agent is first activated."""
+        logger.info("PhoneAssistant activated")
 
-        Args:
-            message (str): The message to say.
-        """
-        if self.model and hasattr(self.model, 'sessions'):
-            session = self.model.sessions[0]
-            session.conversation.item.create(
-                llm.ChatMessage(
-                    role="assistant",
-                    content=f"Using your voice to respond, please say: {message}"
-                )
-            )
-            session.response.create()
-            logger.debug(f"Asked assistant to say: {message}")
+        greeting = (
+            "Hi, thanks for calling Vandelay Industries — global leader in fine latex goods! "
+            "You can press 1 for Billing, 2 for Technical Support, "
+            "or 3 for Customer Service. You can also just talk to me, since I'm a LiveKit agent."
+        )
+        await self.session.generate_reply(user_input=greeting)
 
-    async def connect_to_room(self) -> rtc.Participant:
-        """
-        Connect to the LiveKit room and wait for a participant to join.
+    @function_tool()
+    async def transfer_to_billing(self, context: RunContext_T) -> str:
+        """Transfer the call to the billing department."""
+        room = context.userdata.ctx.room
+        identity = room.local_participant.identity
+        transfer_number = f"tel:{os.getenv('BILLING_PHONE_NUMBER')}"
+        dept_name = "Billing"
+        context.userdata.selected_department = dept_name
+        await self._handle_transfer(identity, transfer_number, dept_name)
+        return f"Transferring to {dept_name} department."
 
-        Returns:
-            rtc.Participant: The connected participant.
-        """
-        room_name = self.context.room.name
-        logger.info(f"Connecting to room: {room_name}")
-        await self.context.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-        self._setup_event_handlers(self.context.room)
-        participant = await self.context.wait_for_participant()
-        return participant
+    @function_tool()
+    async def transfer_to_tech_support(self, context: RunContext_T) -> str:
+        """Transfer the call to the technical support department."""
+        room = context.userdata.ctx.room
+        identity = room.local_participant.identity
+        transfer_number = f"tel:{os.getenv('TECH_SUPPORT_PHONE_NUMBER')}"
+        dept_name = "Tech Support"
+        context.userdata.selected_department = dept_name
+        await self._handle_transfer(identity, transfer_number, dept_name)
+        return f"Transferring to {dept_name} department."
 
-    def _setup_event_handlers(self, room: rtc.Room) -> None:
-        """
-        Set up event handlers for any room events we care about. In this case, it's only the DTMF codes,
-        but you could handle any other room events too.
-
-        Args:
-            room (rtc.Room): The LiveKit room instance.
-        """
-
-        @room.on("sip_dtmf_received")
-        def handle_dtmf(dtmf_event: rtc.SipDTMF):
-            """
-            Handle DTMF (Dual-Tone Multi-Frequency) signals received from SIP. (These are the sounds
-            that are made when a user presses a number on a phone keypad.)
-
-            Args:
-                dtmf_event (rtc.SipDTMF): The DTMF event data.
-            """
-            code = dtmf_event.code
-            digit = dtmf_event.digit
-            identity = dtmf_event.participant.identity
-            logger.info(f"DTMF received - Code: {code}, Digit: '{digit}'")
-
-            # Define department mapping
-            department_numbers = {
-                "1": ("BILLING_PHONE_NUMBER", "Billing"),
-                "2": ("TECH_SUPPORT_PHONE_NUMBER", "Tech Support"),
-                "3": ("CUSTOMER_SERVICE_PHONE_NUMBER", "Customer Service")
-            }
-            logger.info(f"Department numbers: {department_numbers}")
-            if digit in department_numbers:
-                env_var, dept_name = department_numbers[digit]
-                transfer_number = f"tel:{os.getenv(env_var)}"
-                asyncio.create_task(self._handle_transfer(identity, transfer_number, dept_name))
-            else:
-                asyncio.create_task(self.say("I'm sorry, please choose one of the options I mentioned earlier."))
-
+    @function_tool()
+    async def transfer_to_customer_service(self, context: RunContext_T) -> str:
+        """Transfer the call to the customer service department."""
+        room = context.userdata.ctx.room
+        identity = room.local_participant.identity
+        transfer_number = f"tel:{os.getenv('CUSTOMER_SERVICE_PHONE_NUMBER')}"
+        dept_name = "Customer Service"
+        context.userdata.selected_department = dept_name
+        await self._handle_transfer(identity, transfer_number, dept_name)
+        return f"Transferring to {dept_name} department."
 
     async def _handle_transfer(self, identity: str, transfer_number: str, department: str) -> None:
         """
@@ -136,52 +120,13 @@ class PhoneAssistant:
             transfer_number (str): The number to transfer to
             department (str): The name of the department
         """
-        await self.say(f"Transferring you to our {department} department in a moment. Please hold.")
+        await self.session.generate_reply(user_input=f"Transferring you to our {department} department in a moment. Please hold.")
         await asyncio.sleep(6)
         await self.transfer_call(identity, transfer_number)
 
-
-    def start_agent(self, participant: rtc.Participant) -> None:
-        """
-        Initialize and start the multimodal agent.
-
-        Args:
-            participant (rtc.Participant): The participant to interact with.
-        """
-
-        # Initialize the OpenAI model with updated instructions
-        self.model = openai.realtime.RealtimeModel(
-            instructions=(
-                "You are a friendly assistant providing support. "
-                "Please inform users they can:\n"
-                "- Press 1 for Billing\n"
-                "- Press 2 for Technical Support\n"
-                "- Press 3 for Customer Service"
-            ),
-            # We use Audio for voice, and text to feed the model context behind the scenes.
-            # Whenever we use text, it's important to make sure the model knows it's supposed 
-            # to respond with voice. We do this with prompt engineering throughout the agent.
-            modalities=["audio", "text"],
-            voice="sage"
-        )
-
-        # Create and start the multimodal agent
-        self.assistant = MultimodalAgent(model=self.model)
-        self.assistant.start(self.context.room, participant)
-
-        # Greeting with menu options. This is the first thing the assistant says to the user.
-        # You don't need to have a greeting, but it's a good idea to have one if calls are incoming.
-        greeting = (
-            "Hi, thanks for calling Vandelay Industries — global leader in fine latex goods!"
-            "You can press 1 for Billing, 2 for Technical Support, "
-            "or 3 for Customer Service. You can also just talk to me, since I'm a LiveKit agent."
-        )
-        asyncio.create_task(self.say(greeting))
-
     async def transfer_call(self, participant_identity: str, transfer_to: str) -> None:
         """
-        Transfer the SIP call to another number. This will essentially end the current call and start a new one,
-        the PhoneAssistant will no longer be active on the call.
+        Transfer the SIP call to another number.
 
         Args:
             participant_identity (str): The identity of the participant.
@@ -190,66 +135,119 @@ class PhoneAssistant:
         logger.info(f"Transferring call for participant {participant_identity} to {transfer_to}")
 
         try:
-            # Initialize LiveKit API client if not already done
-            if not self.livekit_api:
+            userdata = self.session.userdata
+            if not userdata.livekit_api:
                 livekit_url = os.getenv('LIVEKIT_URL')
                 api_key = os.getenv('LIVEKIT_API_KEY')
                 api_secret = os.getenv('LIVEKIT_API_SECRET')
                 logger.debug(f"Initializing LiveKit API client with URL: {livekit_url}")
-                self.livekit_api = api.LiveKitAPI(
+                userdata.livekit_api = api.LiveKitAPI(
                     url=livekit_url,
                     api_key=api_key,
                     api_secret=api_secret
                 )
 
-            # Create transfer request
             transfer_request = proto_sip.TransferSIPParticipantRequest(
                 participant_identity=participant_identity,
-                room_name=self.context.room.name,
+                room_name=userdata.ctx.room.name,
                 transfer_to=transfer_to,
                 play_dialtone=True
             )
             logger.debug(f"Transfer request: {transfer_request}")
 
-            # Perform transfer
-            await self.livekit_api.sip.transfer_sip_participant(transfer_request)
+            await userdata.livekit_api.sip.transfer_sip_participant(transfer_request)
             logger.info(f"Successfully transferred participant {participant_identity} to {transfer_to}")
 
         except Exception as e:
             logger.error(f"Failed to transfer call: {e}", exc_info=True)
-            await self.say("I'm sorry, I couldn't transfer your call. Is there something else I can help with?")
+            await self.session.generate_reply(user_input="I'm sorry, I couldn't transfer your call. Is there something else I can help with?")
 
-    async def cleanup(self) -> None:
+
+def setup_dtmf_handlers(room: rtc.Room, phone_assistant: PhoneAssistant):
+    """
+    Setup DTMF event handlers for the room.
+
+    Args:
+        room: The LiveKit room
+        phone_assistant: The phone assistant agent
+    """
+
+    async def _async_handle_dtmf(dtmf_event: rtc.SipDTMF):
+        """Asynchronous logic for handling DTMF tones."""
+        await phone_assistant.session.interrupt()
+        logger.info("Interrupted agent due to DTMF")
+
+        code = dtmf_event.code
+        digit = dtmf_event.digit
+        identity = dtmf_event.participant.identity
+        logger.info(f"DTMF received - Code: {code}, Digit: '{digit}'")
+
+        department_numbers = {
+            "1": ("BILLING_PHONE_NUMBER", "Billing"),
+            "2": ("TECH_SUPPORT_PHONE_NUMBER", "Tech Support"),
+            "3": ("CUSTOMER_SERVICE_PHONE_NUMBER", "Customer Service")
+        }
+        logger.info(f"Department numbers: {department_numbers}")
+        if digit in department_numbers:
+            env_var, dept_name = department_numbers[digit]
+            transfer_number = f"tel:{os.getenv(env_var)}"
+            userdata = phone_assistant.session.userdata
+            userdata.selected_department = dept_name
+            await phone_assistant._handle_transfer(identity, transfer_number, dept_name)
+        else:
+            await phone_assistant.session.generate_reply(user_input="I'm sorry, please choose one of the options I mentioned earlier.")
+
+    @room.on("sip_dtmf_received")
+    def handle_dtmf(dtmf_event: rtc.SipDTMF):
         """
-        Clean up resources before shutting down.
+        Synchronous handler for DTMF signals that schedules the async logic.
+
+        Args:
+            dtmf_event (rtc.SipDTMF): The DTMF event data.
         """
-        if self.livekit_api:
-            await self.livekit_api.aclose()
-            self.livekit_api = None
+        asyncio.create_task(_async_handle_dtmf(dtmf_event))
 
 
-async def entrypoint(context: JobContext) -> None:
+async def entrypoint(ctx: JobContext) -> None:
     """
     The main entry point for the phone assistant application.
 
     Args:
-        context (JobContext): The context for the job.
+        ctx (JobContext): The context for the job.
     """
-    assistant = PhoneAssistant(context)
+    await ctx.connect()
+
+    userdata = UserData(ctx=ctx)
+
+    session = AgentSession(
+        userdata=userdata,
+        llm=openai.realtime.RealtimeModel(voice="sage"),
+        vad=silero.VAD.load(),
+        max_tool_steps=3
+    )
+
+    phone_assistant = PhoneAssistant()
+
+    setup_dtmf_handlers(ctx.room, phone_assistant)
+
+    await session.start(
+        room=ctx.room,
+        agent=phone_assistant
+    )
+
     disconnect_event = asyncio.Event()
 
-    @context.room.on("disconnected")
+    @ctx.room.on("disconnected")
     def on_room_disconnect(*args):
         disconnect_event.set()
 
     try:
-        participant = await assistant.connect_to_room()
-        assistant.start_agent(participant)
-        # Wait until the room is disconnected
         await disconnect_event.wait()
     finally:
-        await assistant.cleanup()
+        if userdata.livekit_api:
+            await userdata.livekit_api.aclose()
+            userdata.livekit_api = None
 
 
 if __name__ == "__main__":
-    cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
+    agents.cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
